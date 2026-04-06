@@ -8,135 +8,123 @@ from decimal import Decimal
 from binance import AsyncClient, BinanceSocketManager
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
-from py_clob_client.clob_types import OrderArgs
 
-# --- OCTOBOT CORE CONFIG ---
+# --- LOGGING ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("OctoArb-AGGRESSIVE")
+
 CONFIG = {
     "TRADE_AMOUNT_USDC": 15,
-    "MAX_TOTAL_EXPOSURE": 150,     # Stop trading if $150 is already "in play"
-    "MIN_PROFIT_MARGIN": 0.02,     # 2% minimum gap after fees/slippage
-    "FEE_RATE_BPS": 15,            # 0.15% (Adjusted dynamically in real OctoBot)
-    "SLIPPAGE_LIMIT": 0.003,       # 0.3% max allowed price movement during execution
+    "POLL_INTERVAL": 2,
+    "COOLDOWN": 30,                 # Reduced cooldown for more action
+    "FEE_PERCENT": Decimal("0.015"),   
+    "SLIPPAGE_BPS": Decimal("0.005"),
+    "TARGET_PROBABILITY": Decimal("0.72") # Will buy anything under 72 cents
 }
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("OctoBot-Engine")
-
-class OctoBotPro:
+class ArbBot:
     def __init__(self):
         self.binance_price = Decimal("0")
-        self.poly_price = Decimal("0")
+        self.last_binance_price = Decimal("0")
         self.active_id = None
-        self.total_invested = Decimal("0")
         self.is_trading = False
+        self.demo_balance = Decimal("200.00") 
+        self.trade_count = 0
+        self.start_time = time.time()
         
-        # Initialize Real Client
-        self.client = ClobClient(
+        self.poly_client = ClobClient(
             host="https://clob.polymarket.com",
-            key=os.getenv("PRIVATE_KEY"),
-            chain_id=POLYGON
+            key=os.getenv("PRIVATE_KEY") or "0x" + "1"*64, 
+            chain_id=POLYGON,
+            signature_type=1
         )
 
-    async def check_permissions(self):
-        """OctoBot Step 1: Ensure wallet is approved for USDC and CT"""
-        logger.info("🔐 Verifying Smart Contract Approvals...")
-        # In a real OctoBot, this calls client.get_allowance()
-        # and triggers client.set_allowance() if needed.
-        pass
-
-    def get_market_slug(self):
-        """OctoBot Step 2: Predictive Slug Hunting"""
-        ts = int(time.time() // 900) * 900
-        return f"btc-updown-15m-{ts}"
-
-    async def binance_stream(self):
-        """High-Speed WebSocket Feed"""
-        client = await AsyncClient.create(tld='us')
-        bm = BinanceSocketManager(client)
-        async with bm.symbol_ticker_socket('BTCUSDT') as stream:
-            while True:
-                res = await stream.recv()
-                self.binance_price = Decimal(res['c'])
-
-    async def polymarket_stream(self):
-        """Simulating OctoBot's real-time orderbook listener"""
-        while True:
-            if self.active_id:
-                try:
-                    book = self.client.get_order_book(self.active_id)
-                    if book.asks:
-                        self.poly_price = Decimal(str(book.asks[0].price))
-                except: pass
-            await asyncio.sleep(1) # OctoBot uses WebSockets here for sub-100ms updates
-
-    async def trading_logic_loop(self):
-        """The 'Brain' - Strategy Execution"""
-        logger.info("🧠 OctoBot Strategy Engine Engaged")
-        while True:
-            # 1. Update Market ID if it expires
-            current_slug = self.get_market_slug()
-            if not self.active_id or current_slug not in str(self.active_id):
-                self.active_id = self.fetch_active_token(current_slug)
-            
-            # 2. Risk Check: Exposure
-            if self.total_invested >= CONFIG["MAX_TOTAL_EXPOSURE"]:
-                logger.warning("🚨 Max Exposure Reached. Halting trades.")
-                await asyncio.sleep(60)
-                continue
-
-            # 3. Arbitrage Calculation (Real Math)
-            # We buy if: (Binance Move % > Poly Price %) + Margin
-            if self.binance_price > 0 and self.poly_price > 0:
-                # Actual OctoBot formula involves calculating the 'Fair Value'
-                # based on Binance spot price vs the Strike Price.
-                if self.poly_price < Decimal("0.85") and not self.is_trading:
-                    await self.execute_pro_trade()
-
-            await asyncio.sleep(0.5)
-
-    async def execute_pro_trade(self):
-        """Pro-level execution with Fee Signatures"""
-        self.is_trading = True
-        logger.info(f"🚀 [EXECUTION] Signal Detected at {self.poly_price}")
-        
+    def get_current_btc_token_id(self):
         try:
-            # OctoBot doesn't just 'Buy'; it places a Limit Order at the Ask 
-            # to ensure it doesn't get 'Destroyed' by a sudden price spike.
-            limit_price = float(self.poly_price * Decimal(str(1 + CONFIG["SLIPPAGE_LIMIT"])))
-            size = float(CONFIG["TRADE_AMOUNT_USDC"]) / limit_price
+            ts = int(time.time() // 900) * 900
+            slug = f"btc-updown-15m-{ts}"
+            url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
+            if resp and len(resp) > 0:
+                return json.loads(resp[0].get('clobTokenIds'))[0]
+            return None
+        except: return None
 
-            order_args = OrderArgs(
-                price=round(limit_price, 2),
-                size=round(size, 1),
-                side="BUY",
-                token_id=self.active_id,
-                fee_rate_bps=CONFIG["FEE_RATE_BPS"] # CRITICAL FOR REAL ACCOUNTS
-            )
-            
-            # Real OctoBot checks for balance before firing
-            resp = self.client.create_order(order_args)
-            logger.info(f"💰 [FILL] Order Placed: {resp.get('orderID')}")
-            self.total_invested += Decimal(str(CONFIG["TRADE_AMOUNT_USDC"]))
-            
-            await asyncio.sleep(900) # Wait for market resolution
+    async def start_binance_feed(self):
+        try:
+            client = await AsyncClient.create(tld='us') 
+            bm = BinanceSocketManager(client)
+            ms = bm.symbol_ticker_socket('BTCUSDT')
+            async with ms as tscm:
+                logger.info("✅ Binance Feed Live")
+                while True:
+                    res = await tscm.recv()
+                    if res and 'c' in res:
+                        self.last_binance_price = self.binance_price
+                        self.binance_price = Decimal(res['c'])
         except Exception as e:
-            logger.error(f"❌ [FAIL] Execution Error: {e}")
-        finally:
-            self.is_trading = False
+            logger.error(f"Binance Error: {e}")
+            await asyncio.sleep(5)
 
-    def fetch_active_token(self, slug):
-        url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-        r = requests.get(url).json()
-        if r: return json.loads(r[0]['clobTokenIds'])[0]
-        return None
+    async def heartbeat_logger(self):
+        while True:
+            if self.binance_price > 0:
+                uptime = round((time.time() - self.start_time) / 60, 1)
+                logger.info(f"💓 [UPTIME: {uptime}m] BTC: ${self.binance_price} | Trades: {self.trade_count} | Balance: ${round(self.demo_balance, 2)}")
+            await asyncio.sleep(15) # Pulse every 15s
+
+    async def check_arbitrage_loop(self):
+        logger.info(f"🔍 Aggressive Mode Active (Target < {CONFIG['TARGET_PROBABILITY']})")
+        while True:
+            if not self.active_id:
+                self.active_id = self.get_current_btc_token_id()
+                if not self.active_id:
+                    await asyncio.sleep(10)
+                    continue
+
+            try:
+                book = self.poly_client.get_order_book(self.active_id)
+                if book and book.asks:
+                    raw_price = Decimal(str(book.asks[0].price))
+                    
+                    # LOOSENED RULES:
+                    # 1. Any upward movement (even tiny)
+                    # 2. Price is under 72 cents (approx 70% probability + room for slippage)
+                    if self.binance_price >= self.last_binance_price and raw_price < CONFIG["TARGET_PROBABILITY"]:
+                        if not self.is_trading:
+                            await self.execute_realistic_demo(raw_price)
+
+            except Exception as e:
+                if "404" in str(e): self.active_id = None
+            
+            await asyncio.sleep(CONFIG["POLL_INTERVAL"])
+
+    async def execute_realistic_demo(self, price):
+        self.is_trading = True
+        self.trade_count += 1
+        
+        executed_price = price * (1 + CONFIG["SLIPPAGE_BPS"])
+        fee_cost = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) * CONFIG["FEE_PERCENT"]
+        total_deduction = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) + fee_cost
+        
+        self.demo_balance -= total_deduction
+        
+        logger.info("---------- ⚡ AGGRESSIVE TRADE ----------")
+        logger.info(f"Entry: ${price} | Final: ${round(executed_price, 4)}")
+        logger.info(f"Fee: -${round(fee_cost, 2)} | Result: PENDING")
+        logger.info(f"NEW BALANCE: ${round(self.demo_balance, 2)}")
+        logger.info("----------------------------------------")
+        
+        await asyncio.sleep(CONFIG["COOLDOWN"])
+        self.is_trading = False
 
     async def run(self):
-        await self.check_permissions()
         await asyncio.gather(
-            self.binance_stream(),
-            self.polymarket_stream(),
-            self.trading_logic_loop()
+            self.start_binance_feed(),
+            self.check_arbitrage_loop(),
+            self.heartbeat_logger()
         )
 
 if __name__ == "__main__":
-    asyncio.run(OctoBotPro().run())
+    asyncio.run(ArbBot().run())
