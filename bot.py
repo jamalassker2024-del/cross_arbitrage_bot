@@ -13,8 +13,8 @@ from py_clob_client.clob_types import OrderArgs
 # --- CONFIG ---
 CONFIG = {
     "TRADE_AMOUNT_USDC": 15,
-    "MIN_SPREAD": Decimal("0.02"),
-    "POLL_INTERVAL": 2,
+    "MIN_SPREAD": Decimal("0.02"), # 2% spread target
+    "POLL_INTERVAL": 2,            # Frequency of Poly checks
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,7 +25,7 @@ class ArbBot:
         self.binance_price = Decimal("0")
         self.active_id = None
         self.is_trading = False
-        # Initialize Polymarket Client immediately
+        # Initialize Polymarket Client
         self.poly_client = ClobClient(
             host="https://clob.polymarket.com",
             key=os.getenv("PRIVATE_KEY"),
@@ -34,15 +34,30 @@ class ArbBot:
         )
 
     def get_current_btc_token_id(self):
-        """Fetches active market from Gamma API"""
+        """Fetches active market from Gamma API with User-Agent and slug verification"""
         try:
+            # Polymarket 15m intervals (900s)
             ts = int(time.time() // 900) * 900
+            # Common 2026 slug pattern for BTC 15m markets
             slug = f"bitcoin-price-above-below-15m-{ts}"
             url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-            resp = requests.get(url, timeout=10).json()
+            
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            logger.info(f"🔍 Hunting for market slug: {slug}")
+            
+            resp = requests.get(url, headers=headers, timeout=10).json()
+            
             if resp and len(resp) > 0:
-                token_ids = json.loads(resp[0]['clobTokenIds'])
-                return token_ids[0]
+                # clobTokenIds is usually a stringified list like '["0x123...", "0x456..."]'
+                raw_ids = resp[0].get('clobTokenIds')
+                if raw_ids:
+                    token_ids = json.loads(raw_ids)
+                    new_id = token_ids[0] # [0] is the 'YES' / 'Above' token
+                    logger.info(f"🎯 Market Found! ID: {new_id}")
+                    return new_id
+            
+            logger.warning(f"⚠️ Market slug {slug} not active yet. Retrying...")
+            return None
         except Exception as e:
             logger.error(f"Market Hunt Error: {e}")
         return None
@@ -51,7 +66,7 @@ class ArbBot:
         """Websocket feed with connection monitoring"""
         logger.info("📡 Connecting to Binance WebSocket...")
         try:
-            # Added tld='us' just in case, but change to None if in Europe
+            # 'us' TLD handles US-based IP restrictions; change to None for International
             client = await AsyncClient.create(tld='us') 
             bm = BinanceSocketManager(client)
             ms = bm.symbol_ticker_socket('BTCUSDT')
@@ -60,7 +75,7 @@ class ArbBot:
                 logger.info("✅ Binance WebSocket Connected!")
                 while True:
                     res = await tscm.recv()
-                    if res:
+                    if res and 'c' in res:
                         self.binance_price = Decimal(res['c'])
         except Exception as e:
             logger.error(f"Binance Feed Critical Failure: {e}")
@@ -70,33 +85,42 @@ class ArbBot:
         """Main execution logic"""
         logger.info("🔍 Starting Arbitrage Monitoring Loop...")
         while True:
+            # 1. Ensure we have an active Market ID
             if not self.active_id:
                 self.active_id = self.get_current_btc_token_id()
                 if not self.active_id:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
                     continue
 
+            # 2. Ensure we have a Binance price
             if self.binance_price == 0:
-                # Still waiting for first price from WebSocket
                 await asyncio.sleep(1)
                 continue
 
+            # 3. Check Order Book
             try:
                 book = self.poly_client.get_order_book(self.active_id)
-                if book.asks:
+                if book and book.asks:
                     poly_ask = Decimal(book.asks[0].price)
-                    # Log status every few seconds
+                    
+                    # Log Status every 10 seconds to keep logs clean
                     if int(time.time()) % 10 == 0:
-                        logger.info(f"LIVE: BTC ${self.binance_price} | Poly ${poly_ask}")
+                        logger.info(f"LIVE: BTC ${self.binance_price} | Poly Yes ${poly_ask}")
+                    
+                    # Logic: If price deviates from mid-point significantly
+                    # (Insert execution logic here once logs confirm stable feed)
+
             except Exception as e:
-                logger.warning(f"Loop Warning: {e}")
-                if "404" in str(e): self.active_id = None
+                if "404" in str(e):
+                    logger.warning("Market expired/not found. Re-hunting...")
+                    self.active_id = None
+                else:
+                    logger.error(f"Orderbook Sync Error: {e}")
             
             await asyncio.sleep(CONFIG["POLL_INTERVAL"])
 
     async def run(self):
         logger.info("🚀 Bot Lifecycle Started")
-        # Gather them but with specific names for better debugging
         await asyncio.gather(
             self.start_binance_feed(),
             self.check_arbitrage_loop()
@@ -107,4 +131,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        pass
+        logger.info("🛑 Bot stopped by user.")
