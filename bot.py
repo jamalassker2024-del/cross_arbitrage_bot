@@ -8,19 +8,21 @@ from decimal import Decimal
 from binance import AsyncClient, BinanceSocketManager
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
-from py_clob_client.clob_types import OrderArgs
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("py_clob_client").setLevel(logging.WARNING)
-logger = logging.getLogger("OctoArb-DEMO")
+logger = logging.getLogger("OctoArb-PRO-DEMO")
 
-# --- CONFIG ---
+# --- REALISM CONFIG ---
 CONFIG = {
-    "TRADE_AMOUNT_USDC": 15,       # Virtual trade size
-    "POLL_INTERVAL": 2,            
-    "COOLDOWN": 60,                # Shorter cooldown for Demo mode
+    "TRADE_AMOUNT_USDC": 15,
+    "POLL_INTERVAL": 2,
+    "COOLDOWN": 60,
+    # --- REALISM FACTORS ---
+    "FEE_PERCENT": Decimal("0.015"),   # 1.5% Polymarket Fee simulation
+    "SLIPPAGE_BPS": Decimal("0.005"),  # 0.5% price penalty (getting a worse fill)
 }
 
 class ArbBot:
@@ -29,44 +31,34 @@ class ArbBot:
         self.last_binance_price = Decimal("0")
         self.active_id = None
         self.is_trading = False
-        self.demo_balance = Decimal("200.00") # Starting virtual balance
+        self.demo_balance = Decimal("200.00") 
         
-        # We keep the client initialized to fetch real order book data
         self.poly_client = ClobClient(
             host="https://clob.polymarket.com",
-            key=os.getenv("PRIVATE_KEY") or "0x" + "1"*64, # Dummy key for demo if env is empty
+            key=os.getenv("PRIVATE_KEY") or "0x" + "1"*64, 
             chain_id=POLYGON,
             signature_type=1
         )
 
     def get_current_btc_token_id(self):
-        """Fetches real active market from Gamma API"""
         try:
             ts = int(time.time() // 900) * 900
-            slug_options = [f"btc-updown-15m-{ts}", f"bitcoin-price-above-below-15m-{ts}"]
+            slug = f"btc-updown-15m-{ts}"
             headers = {'User-Agent': 'Mozilla/5.0'}
-            
-            for slug in slug_options:
-                url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-                resp = requests.get(url, headers=headers, timeout=10).json()
-                if resp and len(resp) > 0:
-                    raw_ids = resp[0].get('clobTokenIds')
-                    if raw_ids:
-                        token_ids = json.loads(raw_ids)
-                        return token_ids[0]
+            url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+            resp = requests.get(url, headers=headers, timeout=10).json()
+            if resp and len(resp) > 0:
+                return json.loads(resp[0].get('clobTokenIds'))[0]
             return None
-        except Exception as e:
-            logger.error(f"Market Hunt Error: {e}")
-            return None
+        except: return None
 
     async def start_binance_feed(self):
-        """Streams real BTC price"""
         try:
             client = await AsyncClient.create(tld='us') 
             bm = BinanceSocketManager(client)
             ms = bm.symbol_ticker_socket('BTCUSDT')
             async with ms as tscm:
-                logger.info("✅ Binance Feed Live (Demo Mode)")
+                logger.info("✅ Binance Live (High-Fidelity Demo)")
                 while True:
                     res = await tscm.recv()
                     if res and 'c' in res:
@@ -77,8 +69,7 @@ class ArbBot:
             await asyncio.sleep(5)
 
     async def check_arbitrage_loop(self):
-        """Monitors for opportunities and simulates trades"""
-        logger.info(f"🔍 Monitoring... (Starting Demo Balance: ${self.demo_balance})")
+        logger.info(f"🔍 Monitoring... Balance: ${self.demo_balance}")
         while True:
             if not self.active_id:
                 self.active_id = self.get_current_btc_token_id()
@@ -86,61 +77,50 @@ class ArbBot:
                     await asyncio.sleep(10)
                     continue
 
-            if self.binance_price == 0:
-                await asyncio.sleep(1)
-                continue
-
             try:
                 book = self.poly_client.get_order_book(self.active_id)
                 if book and book.asks:
-                    poly_ask = Decimal(str(book.asks[0].price))
+                    raw_price = Decimal(str(book.asks[0].price))
                     
-                    if int(time.time()) % 10 == 0:
-                        logger.info(f"DEMO: BTC ${self.binance_price} | Poly Yes ${poly_ask}")
-
-                    # --- TRIGGER LOGIC ---
-                    is_pumping = (self.binance_price > self.last_binance_price)
-                    
-                    if is_pumping and poly_ask < Decimal("0.92") and not self.is_trading:
-                        # Simulate the trade without calling the API
-                        await self.execute_demo_trade(poly_ask)
+                    # TRIGGER: Price must be rising AND "cheap"
+                    if self.binance_price > self.last_binance_price and raw_price < Decimal("0.90"):
+                        if not self.is_trading:
+                            await self.execute_realistic_demo(raw_price)
 
             except Exception as e:
-                if "404" in str(e):
-                    self.active_id = None
-                else:
-                    logger.error(f"Orderbook Error: {e}")
+                if "404" in str(e): self.active_id = None
             
             await asyncio.sleep(CONFIG["POLL_INTERVAL"])
 
-    async def execute_demo_trade(self, price):
-        """Simulates a trade and updates demo balance"""
+    async def execute_realistic_demo(self, price):
+        """Simulates a trade with Fees and Slippage applied"""
         self.is_trading = True
-        logger.info("--------------------------------------------------")
-        logger.info(f"🧪 DEMO SIGNAL: Buying YES at ${price}")
         
-        # Calculate shares (Virtual)
-        shares = float(CONFIG["TRADE_AMOUNT_USDC"]) / float(price)
-        self.demo_balance -= Decimal(str(CONFIG["TRADE_AMOUNT_USDC"]))
+        # 1. APPLY SLIPPAGE (Getting a worse price than what we saw)
+        # Real Price = Price + (Price * 0.005)
+        executed_price = price * (1 + CONFIG["SLIPPAGE_BPS"])
         
-        logger.info(f"🛒 PURCHASE: {round(shares, 2)} shares for ${CONFIG['TRADE_AMOUNT_USDC']}")
-        logger.info(f"💰 CURRENT DEMO BALANCE: ${self.demo_balance}")
-        logger.info("--------------------------------------------------")
+        # 2. CALCULATE FEES
+        # Total Cost = Amount + (Amount * 0.015)
+        fee_cost = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) * CONFIG["FEE_PERCENT"]
+        total_deduction = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) + fee_cost
         
-        # Short cooldown for demo purposes
+        # 3. UPDATE VIRTUAL ACCOUNT
+        shares = float(CONFIG["TRADE_AMOUNT_USDC"]) / float(executed_price)
+        self.demo_balance -= total_deduction
+        
+        logger.info("---------- 🧪 REALISTIC TRADE ----------")
+        logger.info(f"Target Price: ${price} | Executed at: ${round(executed_price, 4)}")
+        logger.info(f"Fee Paid: -${round(fee_cost, 4)}")
+        logger.info(f"Shares Bought: {round(shares, 2)}")
+        logger.info(f"NEW BALANCE: ${round(self.demo_balance, 2)}")
+        logger.info("----------------------------------------")
+        
         await asyncio.sleep(CONFIG["COOLDOWN"])
         self.is_trading = False
 
     async def run(self):
-        logger.info("🚀 Bot Started - DEMO / PAPER TRADING MODE")
-        await asyncio.gather(
-            self.start_binance_feed(),
-            self.check_arbitrage_loop()
-        )
+        await asyncio.gather(self.start_binance_feed(), self.check_arbitrage_loop())
 
 if __name__ == "__main__":
-    bot = ArbBot()
-    try:
-        asyncio.run(bot.run())
-    except KeyboardInterrupt:
-        logger.info("🛑 Stopped.")
+    asyncio.run(ArbBot().run())
