@@ -36,27 +36,31 @@ class ArbBot:
     def get_current_btc_token_id(self):
         """Fetches active market from Gamma API with User-Agent and slug verification"""
         try:
-            # Polymarket 15m intervals (900s)
             ts = int(time.time() // 900) * 900
-            # Common 2026 slug pattern for BTC 15m markets
-            slug = f"bitcoin-price-above-below-15m-{ts}"
-            url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+            
+            # 2026 Standardized Slugs to try
+            slug_options = [
+                f"btc-updown-15m-{ts}", 
+                f"bitcoin-price-above-below-15m-{ts}"
+            ]
             
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            logger.info(f"🔍 Hunting for market slug: {slug}")
             
-            resp = requests.get(url, headers=headers, timeout=10).json()
+            for slug in slug_options:
+                url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+                logger.info(f"🔍 Hunting for: {slug}")
+                
+                resp = requests.get(url, headers=headers, timeout=10).json()
+                
+                if resp and len(resp) > 0:
+                    raw_ids = resp[0].get('clobTokenIds')
+                    if raw_ids:
+                        token_ids = json.loads(raw_ids)
+                        new_id = token_ids[0] # Index 0 is 'YES' (Above)
+                        logger.info(f"🎯 Market Found! ID: {new_id}")
+                        return new_id
             
-            if resp and len(resp) > 0:
-                # clobTokenIds is usually a stringified list like '["0x123...", "0x456..."]'
-                raw_ids = resp[0].get('clobTokenIds')
-                if raw_ids:
-                    token_ids = json.loads(raw_ids)
-                    new_id = token_ids[0] # [0] is the 'YES' / 'Above' token
-                    logger.info(f"🎯 Market Found! ID: {new_id}")
-                    return new_id
-            
-            logger.warning(f"⚠️ Market slug {slug} not active yet. Retrying...")
+            logger.warning("⚠️ No active 15m BTC markets found. Waiting for next interval...")
             return None
         except Exception as e:
             logger.error(f"Market Hunt Error: {e}")
@@ -66,7 +70,7 @@ class ArbBot:
         """Websocket feed with connection monitoring"""
         logger.info("📡 Connecting to Binance WebSocket...")
         try:
-            # 'us' TLD handles US-based IP restrictions; change to None for International
+            # Using tld='us' to bypass common regional blocks
             client = await AsyncClient.create(tld='us') 
             bm = BinanceSocketManager(client)
             ms = bm.symbol_ticker_socket('BTCUSDT')
@@ -85,34 +89,34 @@ class ArbBot:
         """Main execution logic"""
         logger.info("🔍 Starting Arbitrage Monitoring Loop...")
         while True:
-            # 1. Ensure we have an active Market ID
             if not self.active_id:
                 self.active_id = self.get_current_btc_token_id()
                 if not self.active_id:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(10) # Wait 10s before retrying Gamma
                     continue
 
-            # 2. Ensure we have a Binance price
             if self.binance_price == 0:
                 await asyncio.sleep(1)
                 continue
 
-            # 3. Check Order Book
             try:
+                # Fixed method: get_order_book
                 book = self.poly_client.get_order_book(self.active_id)
                 if book and book.asks:
                     poly_ask = Decimal(book.asks[0].price)
                     
-                    # Log Status every 10 seconds to keep logs clean
+                    # Print status every 10s
                     if int(time.time()) % 10 == 0:
                         logger.info(f"LIVE: BTC ${self.binance_price} | Poly Yes ${poly_ask}")
                     
-                    # Logic: If price deviates from mid-point significantly
-                    # (Insert execution logic here once logs confirm stable feed)
+                    # SPREAD CALCULATION:
+                    # If Binance price > Poly probability, Poly is "Cheap"
+                    # Note: You need a baseline 'mid-price' for BTC to calculate true probability.
+                    # For now, we are just logging the data.
 
             except Exception as e:
                 if "404" in str(e):
-                    logger.warning("Market expired/not found. Re-hunting...")
+                    logger.warning("Market expired. Resetting ID...")
                     self.active_id = None
                 else:
                     logger.error(f"Orderbook Sync Error: {e}")
