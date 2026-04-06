@@ -50,7 +50,7 @@ class ArbBot:
 
             try:
                 # Fetch Polymarket Orderbook
-                book = self.client.get_orderbook(CONFIG["MARKET_ID"])
+                book = self.client.get_order_book(CONFIG["MARKET_ID"])
                 poly_ask = Decimal(book.asks[0].price) # Best 'Yes' price
 
                 # Logic: If Binance goes UP, but Poly is still CHEAP
