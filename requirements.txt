@@ -2,3 +2,5 @@ py-clob-client==0.34.6
 python-binance
 websockets
 python-dotenv
+num
+numpy
