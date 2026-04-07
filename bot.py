@@ -5,39 +5,40 @@ import logging
 import requests
 import time
 import collections
-import numpy as np
 from decimal import Decimal
 from binance import AsyncClient, BinanceSocketManager
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 
-# --- LOGGING ---
+# --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("OctoArb-REBORN")
+logger = logging.getLogger("OctoArb-Unified")
 
 CONFIG = {
-    "TRADE_AMOUNT_USDC": 15,
+    "TRADE_AMOUNT_USDC": 15.00,
     "POLL_INTERVAL": 1, 
-    "COOLDOWN": 15,     
+    "COOLDOWN": 10,     
     "FEE_PERCENT": Decimal("0.001"),   
-    "SLIPPAGE_BPS": Decimal("0.0005"),
-    "RSI_THRESHOLD": 45, # Lowered for higher trade frequency
-    "TARGET_PROB": Decimal("0.90") 
+    "RSI_THRESHOLD": 48, 
+    "MARKET_DURATION_SEC": 900, # 15-minute settlement windows
+    "MAX_HISTORY": 30
 }
 
 class ArbBot:
     def __init__(self):
         self.binance_price = Decimal("0")
-        self.price_history = collections.deque(maxlen=20) 
-        self.high_history = collections.deque(maxlen=20)
-        self.low_history = collections.deque(maxlen=20)
-        
+        self.price_history = collections.deque(maxlen=CONFIG["MAX_HISTORY"])
         self.active_id = None
+        self.active_market_name = ""
         self.is_trading = False
-        self.demo_balance = Decimal("200.00") 
-        self.trade_count = 0
+        
+        # Performance Tracking
+        self.demo_balance = Decimal("200.00")
+        self.wins = 0
+        self.losses = 0
         self.start_time = time.time()
         
+        # Client Setup
         self.poly_client = ClobClient(
             host="https://clob.polymarket.com",
             key=os.getenv("PRIVATE_KEY") or "0x" + "1"*64, 
@@ -46,127 +47,147 @@ class ArbBot:
         )
 
     def fetch_active_token(self):
-        """Dynamic Market Hunter: Finds the newest active BTC market"""
+        """Finds the newest BTC market on Polymarket without external dependencies"""
         try:
-            url = "https://gamma-api.polymarket.com/markets?active=true&limit=10&query=BTC&order=createdAt&ascending=false"
+            url = "https://gamma-api.polymarket.com/markets?active=true&limit=5&query=BTC&order=createdAt&ascending=false"
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                for market in data:
-                    if not market.get('closed') and market.get('clobTokenIds'):
-                        token_ids = json.loads(market['clobTokenIds'])
-                        logger.info(f"🎯 Market Found: {market['question']}")
-                        return token_ids[0] 
-            return None
+                for m in data:
+                    if not m.get('closed') and m.get('clobTokenIds'):
+                        token_id = json.loads(m['clobTokenIds'])[0]
+                        question = m.get('question', 'Unknown Market')
+                        logger.info(f"🎯 New Market Target: {question}")
+                        return token_id, question
+            return None, ""
         except Exception as e:
-            logger.error(f"⚠️ Discovery Error: {e}")
-            return None
+            logger.error(f"Market Discovery Error: {e}")
+            return None, ""
 
     def calculate_indicators(self):
-        """Calculates RSI and a simple RDI-style Trend Delta"""
+        """Native Python RSI & RDI (No Numpy required)"""
         if len(self.price_history) < 14:
-            return 50, 0
+            return 50.0, 0.0
         
-        prices = np.array(list(self.price_history), dtype=float)
-        deltas = np.diff(prices)
-        seed = deltas[:14]
-        up = seed[seed >= 0].sum() / 14
-        down = -seed[seed < 0].sum() / 14
-        rs = up / (down if down != 0 else 0.001)
-        rsi = 100. - (100. / (1. + rs))
+        prices = list(self.price_history)
+        deltas = [float(prices[i] - prices[i-1]) for i in range(1, len(prices))]
         
-        # RDI (Relative Directional Index) logic: Current vs 5-period Moving Average
-        rdi = prices[-1] - np.mean(prices[-5:])
+        # Simple RSI Math
+        gains = sum([d for d in deltas[-14:] if d > 0]) / 14
+        losses = abs(sum([d for d in deltas[-14:] if d < 0])) / 14
+        
+        rs = gains / (losses if losses > 0 else 0.00001)
+        rsi = 100 - (100 / (1 + rs))
+        
+        # RDI (Directional Index): Difference between price and 5-period average
+        avg_5 = sum(prices[-5:]) / 5
+        rdi = float(prices[-1]) - float(avg_5)
+        
         return rsi, rdi
 
     async def start_binance_feed(self):
+        """Streams real-time BTC prices from Binance"""
         try:
-            client = await AsyncClient.create() 
+            client = await AsyncClient.create()
             bm = BinanceSocketManager(client)
-            ms = bm.symbol_ticker_socket('BTCUSDT')
-            async with ms as tscm:
-                logger.info("✅ Binance Feed Connected")
+            async with bm.symbol_ticker_socket('BTCUSDT') as tscm:
+                logger.info("✅ Binance WebSocket Connected")
                 while True:
                     res = await tscm.recv()
                     if res and 'c' in res:
-                        p = Decimal(res['c'])
-                        self.binance_price = p
-                        self.price_history.append(p)
-                        self.high_history.append(Decimal(res['h']))
-                        self.low_history.append(Decimal(res['l']))
+                        self.binance_price = Decimal(res['c'])
+                        self.price_history.append(self.binance_price)
         except Exception as e:
-            logger.error(f"Binance Error: {e}")
+            logger.error(f"Binance Connection Lost: {e}")
             await asyncio.sleep(5)
 
-    async def heartbeat_logger(self):
-        while True:
-            if self.binance_price > 0:
-                rsi, rdi = self.calculate_indicators()
-                uptime = round((time.time() - self.start_time) / 60, 1)
-                logger.info(f"💓 [UPTIME: {uptime}m] BTC: ${self.binance_price} | RSI: {round(rsi, 1)} | Balance: ${round(self.demo_balance, 2)}")
-            await asyncio.sleep(15)
+    async def settle_trade(self, entry_price, strike_at_trade, trade_id):
+        """Simulates 15-minute settlement and tracks PnL"""
+        logger.info(f"⏳ Trade #{trade_id} locked. Settling in {CONFIG['MARKET_DURATION_SEC']/60}m...")
+        await asyncio.sleep(CONFIG["MARKET_DURATION_SEC"])
+        
+        current_btc = self.binance_price
+        shares_bought = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) / entry_price
+        
+        if current_btc > strike_at_trade:
+            # Winning shares pay out $1.00 each
+            payout = shares_bought * Decimal("1.00")
+            self.demo_balance += payout
+            self.wins += 1
+            logger.info(f"💰 WIN! BTC ${current_btc} > Strike ${strike_at_trade}. Payout: ${round(payout, 2)}")
+        else:
+            self.losses += 1
+            logger.info(f"📉 LOSS. BTC ${current_btc} <= Strike ${strike_at_trade}. Position expired.")
 
     async def check_arbitrage_loop(self):
-        logger.info("🔍 Monitoring Binance vs Polymarket...")
+        """Main strategy loop: Checks RSI momentum vs Polymarket price lag"""
         while True:
             if not self.active_id:
-                self.active_id = self.fetch_active_token()
+                self.active_id, self.active_market_name = self.fetch_active_token()
                 if not self.active_id:
                     await asyncio.sleep(5)
                     continue
 
             try:
-                # 1. Get Poly Price
                 book = self.poly_client.get_order_book(self.active_id)
-                if not hasattr(book, 'asks') or not book.asks:
-                    continue
-                
-                poly_price = Decimal(str(book.asks[0].price))
-                rsi, rdi = self.calculate_indicators()
+                if hasattr(book, 'asks') and book.asks:
+                    poly_price = Decimal(str(book.asks[0].price))
+                    rsi, rdi = self.calculate_indicators()
 
-                # 2. Strategy Logic: Binance Moving Up + Poly Price Lagging
-                if rsi > CONFIG["RSI_THRESHOLD"] and rdi > 0:
-                    if poly_price < CONFIG["TARGET_PROB"] and not self.is_trading:
-                        await self.execute_realistic_demo(poly_price, rsi)
+                    # STRATEGY: Bullish RSI + Positive Momentum + Lagging Poly Price
+                    if rsi > CONFIG["RSI_THRESHOLD"] and rdi > 0 and poly_price < 0.85:
+                        if not self.is_trading and self.demo_balance > CONFIG["TRADE_AMOUNT_USDC"]:
+                            await self.execute_trade_flow(poly_price, rsi)
 
             except Exception as e:
-                # FIX: Catch the 404 and reset ID to find a new market
                 if "404" in str(e) or "No orderbook" in str(e):
-                    logger.warning("🔄 Current market expired. Resetting...")
                     self.active_id = None
-                else:
-                    logger.error(f"Loop Error: {e}")
                 await asyncio.sleep(2)
             
             await asyncio.sleep(CONFIG["POLL_INTERVAL"])
 
-    async def execute_realistic_demo(self, price, current_rsi):
+    async def execute_trade_flow(self, poly_price, rsi):
+        """Handles the 'Buy' and kicks off the background settlement task"""
         self.is_trading = True
-        self.trade_count += 1
+        trade_id = self.wins + self.losses + 1
         
-        fee_cost = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) * CONFIG["FEE_PERCENT"]
-        total_deduction = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) + fee_cost
-        self.demo_balance -= total_deduction
+        fee = Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) * CONFIG["FEE_PERCENT"]
+        self.demo_balance -= (Decimal(str(CONFIG["TRADE_AMOUNT_USDC"])) + fee)
         
-        logger.info("---------- ⚡ TRADE EXECUTED (DEMO) ----------")
-        logger.info(f"RSI: {round(current_rsi, 2)} | Poly Price: {price}")
-        logger.info(f"Deducted: ${total_deduction} | Remaining: ${round(self.demo_balance, 2)}")
-        logger.info("---------------------------------------------")
+        strike = self.binance_price
+        logger.info(f"🚀 TRADE #{trade_id} EXECUTED")
+        logger.info(f"Context: RSI {round(rsi, 1)} | Price: {poly_price} | BTC Strike: ${strike}")
+        
+        # Run settlement in background so bot can keep monitoring
+        asyncio.create_task(self.settle_trade(poly_price, strike, trade_id))
         
         await asyncio.sleep(CONFIG["COOLDOWN"])
         self.is_trading = False
 
+    async def heartbeat(self):
+        """Displays status updates every 20 seconds"""
+        while True:
+            if self.binance_price > 0:
+                uptime = round((time.time() - self.start_time) / 60, 1)
+                total_trades = self.wins + self.losses
+                win_rate = (self.wins / total_trades * 100) if total_trades > 0 else 0
+                
+                logger.info("--- 💓 HEARTBEAT ---")
+                logger.info(f"UP: {uptime}m | BTC: ${self.binance_price} | Bal: ${round(self.demo_balance, 2)}")
+                logger.info(f"Stats: {self.wins}W - {self.losses}L ({round(win_rate, 1)}%)")
+                logger.info("--------------------")
+            await asyncio.sleep(20)
+
     async def run(self):
+        logger.info("🤖 Bot starting up...")
         await asyncio.gather(
             self.start_binance_feed(),
             self.check_arbitrage_loop(),
-            self.heartbeat_logger()
+            self.heartbeat()
         )
 
 if __name__ == "__main__":
     try:
         asyncio.run(ArbBot().run())
     except KeyboardInterrupt:
-        pass
-    except Exception as global_e:
-        logger.critical(f"FATAL CRASH: {global_e}")
+        logger.info("🛑 Bot stopped by user.")
