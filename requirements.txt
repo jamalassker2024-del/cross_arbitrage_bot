@@ -5,5 +5,5 @@ python-dotenv
 requests
 numpy
 pandas
-cctx
+ccxt
 aiohttp
