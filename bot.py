@@ -7,7 +7,7 @@ from decimal import Decimal
 # --- SANDBOX CONFIGURATION ---
 CONFIG = {
     "SYMBOL": "BTCUSDT",
-    "TRADE_SIZE": 20.00,
+    "TRADE_SIZE": 5.00,
     "MIN_SPREAD_THRESHOLD": 0.40,  # 0.40% gap triggers the 'Trade'
     "POLL_SPEED": 2.5,             # Seconds between checks
     "POLY_TOKEN_ID": "BTC_HIT_70K" # Simulated Target
@@ -20,7 +20,7 @@ class CrossArbSandbox:
     def __init__(self):
         self.binance_url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={CONFIG['SYMBOL']}"
         self.poly_price_url = "https://clob.polymarket.com/price" # 2026 Public Price Endpoint
-        self.demo_balance = Decimal("1000.00")
+        self.demo_balance = Decimal("20.00")
         self.total_trades = 0
 
     async def get_market_prices(self):
