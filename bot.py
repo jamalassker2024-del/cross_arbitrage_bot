@@ -20,7 +20,7 @@ CONFIG = {
     "SYMBOLS": ["dogeusdt", "pepeusdt", "solusdt", "ethusdt", "btcusdt"],
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
-    "MIN_SPREAD_BPS": Decimal("8"),              # Lowered to 8bps to catch more trades
+    "MIN_SPREAD_BPS": Decimal("3"),              # Lowered to 8bps to catch more trades
     "BINANCE_FEE_BPS": Decimal("10"),
     "BYBIT_FEE_BPS": Decimal("5.5"),
     "TOTAL_FEES_BPS": Decimal("15.5"),
